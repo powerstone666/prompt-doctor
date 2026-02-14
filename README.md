@@ -11,82 +11,61 @@ An MCP (Model Context Protocol) server that improves user prompts for clarity an
 
 ## Requirements
 
-- Node.js 18+ (for built-in `fetch`)
+- Node.js 18+ (Node.js 20+ recommended)
 - npm
 
-## Install and Build
+## Environment Setup
+
+Create a `.env` file (or set env vars in your shell/MCP client config):
+
+```bash
+LLM_BASE_URL=https://your-litellm-host/v1/chat/completions
+LLM_MODEL=your-model
+LLM_API_KEY=your-api-key
+
+# Optional
+LLM_TEMPERATURE=0.2
+LLM_MAX_TOKENS=1000
+```
+
+The server also accepts `LITELLM_*` variants:
+
+- `LITELLM_BASE_URL`
+- `LITELLM_MODEL`
+- `LITELLM_API_KEY`
+- `LITELLM_TEMPERATURE`
+- `LITELLM_MAX_TOKENS`
+
+## Local Development
+
+Install dependencies and build:
 
 ```bash
 npm install
 npm run build
 ```
 
-Build output is written to `build/`, and `src/prompt.txt` is copied to `build/prompt.txt`.
-
-## Configuration
-
-The server requires these environment variables:
-
-- `LLM_BASE_URL` (LiteLLM-compatible endpoint)
-- `LLM_MODEL` (model name)
-- `LLM_API_KEY` (API key)
-
-Optional:
-
-- `LLM_TEMPERATURE` (default: `0.2`)
-- `LLM_MAX_TOKENS` (omit to use the model maximum)
-
-You can plug in any model compatible with LiteLLM.
-
-## Run Locally
+Run locally:
 
 ```bash
-npm run build
 node build/server.js
 ```
 
 You should see:
 
-```
+```text
 prompt doctor server running on stdio
 ```
 
-## Codex Setup (MCP)
+## Use as an npm Package
 
-This project is tested with OpenAI Codex. It should also work with any MCP-compatible client.
-
-1. Build the project:
+Install globally:
 
 ```bash
-npm run build
+npm install -g prompt-doctor
 ```
 
-2. Add a new MCP server in your Codex configuration. The exact file location depends on your Codex setup. Choose one of the following options:
-
-Option A: Run the built file directly with Node (no global install required):
-
-```json
-{
-  "mcpServers": {
-    "prompt-doctor": {
-      "command": "node",
-      "args": ["/ABSOLUTE/PATH/TO/build/server.js"],
-      "env": {
-        "LLM_BASE_URL": "https://your-litellm-host/v1/chat/completions",
-        "LLM_MODEL": "your-model",
-        "LLM_API_KEY": "your-api-key"
-      }
-    }
-  }
-}
-```
-
-Option B: Use the `prompt-doctor` CLI (requires the package to be installed and on your PATH). For local development, you can build and link it:
-
-```bash
-npm run build
-npm link
-```
+Then configure your MCP client to run the CLI:
 
 ```json
 {
@@ -104,7 +83,28 @@ npm link
 }
 ```
 
-3. Restart Codex to pick up the new MCP server.
+Alternative (no global install): use the built file directly.
+
+```json
+{
+  "mcpServers": {
+    "prompt-doctor": {
+      "command": "node",
+      "args": ["/ABSOLUTE/PATH/TO/build/server.js"],
+      "env": {
+        "LLM_BASE_URL": "https://your-litellm-host/v1/chat/completions",
+        "LLM_MODEL": "your-model",
+        "LLM_API_KEY": "your-api-key"
+      }
+    }
+  }
+}
+```
+
+## Codex Setup (MCP)
+
+1. Add one of the MCP server configurations above.
+2. Restart Codex to pick up the new MCP server.
 
 ## Usage
 
@@ -112,7 +112,7 @@ Once configured, Codex (or any MCP client) will call `enhance_prompt` for each u
 
 ## Customizing the Prompt
 
-Edit `src/prompt.txt` to change how prompts are rewritten, then rebuild:
+Edit `src/prompt.txt` and rebuild:
 
 ```bash
 npm run build
