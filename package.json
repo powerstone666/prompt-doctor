@@ -1,0 +1,29 @@
+{
+  "name": "prompt-doctor",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "bin": {
+    "prompt-doctor": "./build/server.js"
+  },
+  "scripts": {
+    "build": "tsc && chmod 755 build/server.js",
+    "prepare": "npm run build",
+    "postbuild": "cp src/prompt.txt build/prompt.txt"
+  },
+  "files": [
+    "build"
+  ],
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "zod": "^3.25.76"
+  }
+}
