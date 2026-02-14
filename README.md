@@ -128,4 +128,4 @@ Issues and pull requests are welcome. Please keep changes focused and include a 
 
 ## License
 
-ISC
+MIT
