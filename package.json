@@ -1,10 +1,10 @@
 {
   "name": "prompt-doctor",
   "version": "1.0.0",
-  "main": "server.js",
+  "main": "build/server.js",
   "type": "module",
   "bin": {
-    "prompt-doctor": "./build/server.js"
+    "prompt-doctor": "build/server.js"
   },
   "scripts": {
     "build": "tsc && chmod 755 build/server.js",
