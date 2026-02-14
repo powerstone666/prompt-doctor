@@ -1,6 +1,6 @@
 {
   "name": "prompt-doctor",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "main": "build/server.js",
   "type": "module",
   "bin": {
