@@ -1,4 +1,4 @@
-# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
+# This workflow will build/test and publish to the npm registry when a release is created.
 # For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
 
 name: Node.js Package
@@ -6,6 +6,7 @@ name: Node.js Package
 on:
   release:
     types: [created]
+  workflow_dispatch: {}
 
 jobs:
   build:
@@ -15,8 +16,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
       - run: npm ci
-      - run: npm test
+      - run: npm run test --if-present
+      - run: npm run build
 
   publish-npm:
     needs: build
@@ -27,7 +30,9 @@ jobs:
         with:
           node-version: 20
           registry-url: https://registry.npmjs.org/
+          cache: npm
       - run: npm ci
+      - run: npm run build
       - run: npm publish
         env:
-          NODE_AUTH_TOKEN: ${{secrets.npm_token}}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
