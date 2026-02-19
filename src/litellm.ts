@@ -4,40 +4,35 @@ type LiteLLMConfig = {
   baseUrl?: string;
   model?: string;
   apiKey?: string;
-  temperature?: number;
-  maxTokens?: number;
 };
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
   content: string;
+  cache_control?: { type: "ephemeral" };
 };
+
+const DEFAULT_TEMPERATURE = 0.2;
+const DEFAULT_MAX_TOKENS = 1000;
 
 export class LiteLLMClient {
   private readonly baseUrl: string;
   private readonly model: string;
   private readonly apiKey: string;
   private readonly temperature: number;
-  private readonly maxTokens?: number;
+  private readonly maxTokens: number;
   private readonly systemPrompt: string;
 
   constructor(config: LiteLLMConfig = {}) {
-    const baseUrl = config.baseUrl ?? process.env.LLM_BASE_URL ?? process.env.LITELLM_BASE_URL;
-    const model = config.model ?? process.env.LLM_MODEL ?? process.env.LITELLM_MODEL;
-    const apiKey = config.apiKey ?? process.env.LLM_API_KEY ?? process.env.LITELLM_API_KEY;
+    const baseUrl = config.baseUrl ?? process.env.LLM_BASE_URL;
+    const model = config.model ?? process.env.LLM_MODEL;
+    const apiKey = config.apiKey ?? process.env.LLM_API_KEY;
 
-    this.baseUrl = this.requireConfig(baseUrl, "LLM_BASE_URL (or LITELLM_BASE_URL)");
-    this.model = this.requireConfig(model, "LLM_MODEL (or LITELLM_MODEL)");
-    this.apiKey = this.requireConfig(apiKey, "LLM_API_KEY (or LITELLM_API_KEY)");
-    this.temperature =
-      config.temperature ??
-      this.getOptionalNumber("LLM_TEMPERATURE") ??
-      this.getOptionalNumber("LITELLM_TEMPERATURE") ??
-      0.2;
-    this.maxTokens =
-      config.maxTokens ??
-      this.getOptionalNumber("LLM_MAX_TOKENS") ??
-      this.getOptionalNumber("LITELLM_MAX_TOKENS");
+    this.baseUrl = this.requireConfig(baseUrl, "LLM_BASE_URL");
+    this.model = this.requireConfig(model, "LLM_MODEL");
+    this.apiKey = this.requireConfig(apiKey, "LLM_API_KEY");
+    this.temperature = DEFAULT_TEMPERATURE;
+    this.maxTokens = DEFAULT_MAX_TOKENS;
     this.systemPrompt = this.loadSystemPrompt();
   }
 
@@ -46,17 +41,35 @@ export class LiteLLMClient {
     return this.call(messages);
   }
 
-  private buildMessages(prompt: string): ChatMessage[] {
-    return [
+  public async enhancePromptWithContext(prompt: string, repoContext?: string): Promise<string> {
+    const messages = this.buildMessages(prompt, repoContext);
+    return this.call(messages);
+  }
+
+  private buildMessages(prompt: string, repoContext?: string): ChatMessage[] {
+    const messages: ChatMessage[] = [
       {
         role: "system",
-        content: this.systemPrompt
-      },
-      {
-        role: "user",
-        content: prompt
+        content: this.systemPrompt,
+        cache_control: { type: "ephemeral" as const }
       }
     ];
+
+    if (repoContext?.trim()) {
+      messages.push({
+        role: "system",
+        content:
+          "Repository context is provided below. Use it only when relevant and do not invent details not present.\n\n" +
+          repoContext
+      });
+    }
+
+    messages.push({
+      role: "user",
+      content: prompt
+    });
+
+    return messages;
   }
 
   private loadSystemPrompt(): string {
@@ -75,14 +88,6 @@ export class LiteLLMClient {
     return value;
   }
 
-  private getOptionalNumber(name: string): number | undefined {
-    const value = process.env[name];
-    if (!value) return undefined;
-    const parsed = Number(value);
-    if (Number.isNaN(parsed)) return undefined;
-    return parsed;
-  }
-
   private async call(messages: ChatMessage[]): Promise<string> {
     const url = this.baseUrl;
 
@@ -90,7 +95,11 @@ export class LiteLLMClient {
       model: this.model,
       messages,
       temperature: this.temperature,
-      ...(this.maxTokens !== undefined ? { max_tokens: this.maxTokens } : {})
+      max_tokens: this.maxTokens,
+      cache: true,
+      metadata: {
+        system_prompt_cached: true
+      }
     };
 
     const response = await fetch(url, {

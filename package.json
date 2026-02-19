@@ -1,6 +1,6 @@
 {
   "name": "prompt-doctor",
-  "version": "1.0.2",
+  "version": "2.0.0",
   "main": "build/server.js",
   "type": "module",
   "bin": {
@@ -16,13 +16,14 @@
   ],
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "description": "",
   "devDependencies": {
     "@types/node": "^25.2.3",
     "typescript": "^5.9.3"
   },
   "dependencies": {
+    "@huggingface/transformers": "^3.7.2",
     "@modelcontextprotocol/sdk": "^1.26.0",
     "zod": "^3.25.76"
   }
