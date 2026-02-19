@@ -36,7 +36,6 @@ type PersistedChunk = {
   endLine: number;
   text: string;
   lexicalTerms: string[];
-  embedding?: number[];
 };
 
 type PersistedIndex = {
@@ -188,6 +187,7 @@ export class CodebaseContextRetriever {
   private indexChunks: CodeChunk[] = [];
   private indexFingerprint = "";
   private indexPromise: Promise<void> | null = null;
+  private indexingStarted = false;
 
   constructor(config: RetrieverConfig = {}) {
     this.rootDir = config.rootDir ?? process.cwd();
@@ -206,7 +206,10 @@ export class CodebaseContextRetriever {
       return undefined;
     }
 
-    await this.ensureIndex();
+    // Start indexing in background if not already started
+    this.startIndexingIfNeeded();
+
+    // Use whatever index is currently available (might be partial or empty)
     if (this.indexChunks.length === 0) {
       return undefined;
     }
@@ -228,6 +231,46 @@ export class CodebaseContextRetriever {
     }
 
     return this.formatContext(selected, normalizedActiveFile, activeFileChunks);
+  }
+
+  private startIndexingIfNeeded(): void {
+    if (this.indexingStarted) {
+      return;
+    }
+
+    this.indexingStarted = true;
+    
+    // Try to eagerly load cached index for immediate use
+    this.tryLoadCachedIndexSync();
+    
+    // Fire and forget - full indexing happens in background
+    this.ensureIndex().catch((error) => {
+      console.error("Background indexing failed:", error);
+    });
+  }
+
+  private tryLoadCachedIndexSync(): void {
+    // Attempt to read and parse cached index synchronously for immediate availability
+    // This is a best-effort attempt - any errors are silently ignored
+    try {
+      const fs = require("node:fs");
+      const raw = fs.readFileSync(this.ragIndexFilePath, "utf8");
+      const parsed = JSON.parse(raw) as PersistedIndex;
+      
+      if (parsed.version === PERSISTED_INDEX_VERSION && Array.isArray(parsed.chunks)) {
+        this.indexChunks = parsed.chunks.map((chunk) => ({
+          filePath: chunk.filePath,
+          startLine: chunk.startLine,
+          endLine: chunk.endLine,
+          text: chunk.text,
+          lexicalTerms: new Set(chunk.lexicalTerms)
+        }));
+        this.indexFingerprint = parsed.fingerprint;
+        console.error(`Loaded ${this.indexChunks.length} chunks from cache for immediate use`);
+      }
+    } catch {
+      // Cache not available or invalid - background indexing will handle it
+    }
   }
 
   private async ensureIndex(): Promise<void> {
@@ -298,13 +341,11 @@ export class CodebaseContextRetriever {
       nextChunks.push(...chunks);
     }
 
-    const extractor = await this.getExtractor();
-    if (extractor) {
-      await this.embedChunks(nextChunks, extractor);
-    }
+    // Skip embedding during indexing - embed only at query time for speed
 
     this.indexFingerprint = fingerprint;
     this.indexChunks = nextChunks;
+    console.error(`Indexed ${nextChunks.length} chunks from ${files.length} files (background)`);
     await this.persistIndex(fingerprint, nextChunks);
   }
 
@@ -354,23 +395,89 @@ export class CodebaseContextRetriever {
     const chunks: CodeChunk[] = [];
     const step = Math.max(1, this.maxChunkLines - this.chunkOverlapLines);
 
+    // First pass: identify code structure boundaries (functions, classes, exports)
+    const boundaries = this.identifyCodeBoundaries(lines);
+
     for (let start = 0; start < lines.length; start += step) {
       const end = Math.min(lines.length, start + this.maxChunkLines);
-      const text = lines.slice(start, end).join("\n").trim();
+      
+      // Try to align chunk with code boundaries for better semantic coherence
+      const alignedEnd = this.alignToCodeBoundary(start, end, boundaries);
+      
+      const text = lines.slice(start, alignedEnd).join("\n").trim();
       if (!text) {
         continue;
       }
 
+      const chunkMetadata = this.extractChunkMetadata(text);
+
       chunks.push({
         filePath: relativePath,
         startLine: start + 1,
-        endLine: end,
-        text,
+        endLine: alignedEnd,
+        text: chunkMetadata ? `[${chunkMetadata}]\n${text}` : text,
         lexicalTerms: this.tokenize(text)
       });
     }
 
     return chunks;
+  }
+
+  private identifyCodeBoundaries(lines: string[]): Set<number> {
+    const boundaries = new Set<number>();
+    const functionPatterns = [
+      /^\s*(export\s+)?(async\s+)?function\s+\w+/,
+      /^\s*(export\s+)?(const|let|var)\s+\w+\s*=\s*(async\s+)?\(/,
+      /^\s*(public|private|protected|static)\s+(async\s+)?\w+\s*\(/,
+      /^\s*\w+\s*\([^)]*\)\s*\{/
+    ];
+    const classPatterns = [
+      /^\s*(export\s+)?(abstract\s+)?class\s+\w+/,
+      /^\s*(export\s+)?interface\s+\w+/,
+      /^\s*(export\s+)?type\s+\w+\s*=/,
+      /^\s*(export\s+)?enum\s+\w+/
+    ];
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const isFunction = functionPatterns.some(p => p.test(line));
+      const isClass = classPatterns.some(p => p.test(line));
+      
+      if (isFunction || isClass) {
+        boundaries.add(i);
+      }
+    }
+
+    return boundaries;
+  }
+
+  private alignToCodeBoundary(start: number, end: number, boundaries: Set<number>): number {
+    // If we're close to a boundary, extend to include it
+    for (let i = end; i < Math.min(end + 5, start + this.maxChunkLines); i++) {
+      if (boundaries.has(i)) {
+        return i;
+      }
+    }
+    return end;
+  }
+
+  private extractChunkMetadata(text: string): string | null {
+    // Extract key code structure information for context
+    const functionMatch = text.match(/(?:export\s+)?(?:async\s+)?function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(|(?:public|private|protected|static)\s+(?:async\s+)?(\w+)\s*\(/);
+    const classMatch = text.match(/(?:export\s+)?(?:abstract\s+)?class\s+(\w+)|(?:export\s+)?interface\s+(\w+)|(?:export\s+)?type\s+(\w+)\s*=/);
+    
+    if (functionMatch) {
+      const name = functionMatch[1] || functionMatch[2] || functionMatch[3];
+      return `Function: ${name}`;
+    }
+    if (classMatch) {
+      const name = classMatch[1] || classMatch[2] || classMatch[3];
+      const type = classMatch[0].includes('interface') ? 'Interface' : 
+                   classMatch[0].includes('type') ? 'Type' : 'Class';
+      return `${type}: ${name}`;
+    }
+    
+    return null;
   }
 
   private tokenize(input: string): Set<string> {
@@ -413,15 +520,20 @@ export class CodebaseContextRetriever {
       return lexicalCandidates;
     }
 
+    // Embed query and candidates on-demand for semantic reranking
     const queryEmbedding = await this.embedText(prompt, extractor);
     if (!queryEmbedding) {
       return lexicalCandidates;
     }
 
+    // Embed only the lexical candidates (much smaller set)
+    const candidateTexts = lexicalCandidates.map(c => c.chunk.text);
+    const candidateEmbeddings = await this.embedBatch(candidateTexts, extractor);
+
     const reranked = lexicalCandidates
-      .map((candidate) => {
-        const vectorScore = candidate.chunk.embedding
-          ? this.cosineSimilarity(queryEmbedding, candidate.chunk.embedding)
+      .map((candidate, index) => {
+        const vectorScore = candidateEmbeddings[index]
+          ? this.cosineSimilarity(queryEmbedding, candidateEmbeddings[index])
           : 0;
         return {
           chunk: candidate.chunk,
@@ -435,37 +547,50 @@ export class CodebaseContextRetriever {
 
   private formatContext(chunks: CodeChunk[], activeFile?: string, activeFileChunks: CodeChunk[] = []): string {
     const sections: string[] = [];
+    
+    // Active file section - ALWAYS first and clearly marked
     if (activeFile) {
       const activeChunk = activeFileChunks[0];
       const summary = activeChunk ? this.summarizeChunk(activeChunk.text) : "No indexed excerpt available.";
-      const activeSectionParts = [`Active file: ${activeFile}\nWhat this file contains: ${summary}`];
+      const activeSectionParts = [
+        "=== ACTIVE FILE (PRIMARY TARGET) ===",
+        `File path: ${activeFile}`,
+        `Summary: ${summary}`,
+        ""
+      ];
+      
       if (activeFileChunks.length > 0) {
         activeSectionParts.push(
+          "Code excerpts from active file:\n" +
           activeFileChunks
             .map(
               (chunk) =>
-                `Active file excerpt: ${chunk.filePath}:${chunk.startLine}\n` +
-                "```txt\n" +
+                `Lines ${chunk.startLine}-${chunk.endLine}:\n` +
+                "```\n" +
                 `${chunk.text}\n` +
                 "```"
             )
             .join("\n\n")
         );
       }
-      sections.push(activeSectionParts.join("\n\n"));
+      sections.push(activeSectionParts.join("\n"));
     }
 
-    sections.push(
-      chunks
-      .map(
-        (chunk) =>
-          `File: ${chunk.filePath}:${chunk.startLine}\n` +
-          "```txt\n" +
-          `${chunk.text}\n` +
-          "```"
-      )
-      .join("\n\n")
-    );
+    // Reference context - clearly marked as reference only
+    if (chunks.length > 0) {
+      sections.push(
+        "=== REFERENCE CONTEXT (for patterns/conventions only) ===\n" +
+        chunks
+          .map(
+            (chunk) =>
+              `File: ${chunk.filePath} (lines ${chunk.startLine}-${chunk.endLine})\n` +
+              "```\n" +
+              `${chunk.text}\n` +
+              "```"
+          )
+          .join("\n\n")
+      );
+    }
 
     return sections.join("\n\n");
   }
@@ -503,19 +628,6 @@ export class CodebaseContextRetriever {
 
     const compact = firstLine.replace(/\s+/g, " ");
     return compact.length > 180 ? `${compact.slice(0, 177)}...` : compact;
-  }
-
-  private async embedChunks(chunks: CodeChunk[], extractor: FeatureExtractor): Promise<void> {
-    for (let index = 0; index < chunks.length; index += OPTIMAL_EMBED_BATCH_SIZE) {
-      const batch = chunks.slice(index, index + OPTIMAL_EMBED_BATCH_SIZE);
-      const vectors = await this.embedBatch(
-        batch.map((chunk) => chunk.text),
-        extractor
-      );
-      for (let offset = 0; offset < batch.length; offset += 1) {
-        batch[offset].embedding = vectors[offset];
-      }
-    }
   }
 
   private async embedBatch(input: string[], extractor: FeatureExtractor): Promise<number[][]> {
@@ -574,8 +686,7 @@ export class CodebaseContextRetriever {
         startLine: chunk.startLine,
         endLine: chunk.endLine,
         text: chunk.text,
-        lexicalTerms: new Set(chunk.lexicalTerms),
-        embedding: chunk.embedding
+        lexicalTerms: new Set(chunk.lexicalTerms)
       }));
     } catch {
       return undefined;
@@ -594,8 +705,7 @@ export class CodebaseContextRetriever {
         startLine: chunk.startLine,
         endLine: chunk.endLine,
         text: chunk.text,
-        lexicalTerms: Array.from(chunk.lexicalTerms),
-        embedding: chunk.embedding
+        lexicalTerms: Array.from(chunk.lexicalTerms)
       }))
     };
 

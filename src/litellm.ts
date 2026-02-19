@@ -59,7 +59,9 @@ export class LiteLLMClient {
       messages.push({
         role: "system",
         content:
-          "Repository context is provided below. Use it only when relevant and do not invent details not present.\n\n" +
+          "Repository context is provided below.\n\n" +
+          "ACTIVE FILE SECTION (if present): This is the PRIMARY TARGET of the user's request. All vague references (\"this file\", \"here\", \"current page\") point to this file. Use the exact path and excerpts provided.\n\n" +
+          "OTHER FILE SECTIONS: These are REFERENCE ONLY for understanding patterns and conventions. Do not treat them as targets or facts about what to search/modify unless the user explicitly names them. If reference context contradicts user intent, ignore it.\n\n" +
           repoContext
       });
     }
