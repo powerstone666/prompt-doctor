@@ -69,7 +69,22 @@ const RAG_DIRECTORY_NAME = ".rag";
 const RAG_INDEX_FILE_NAME = "code-index-v1.json";
 const RAG_EXCLUSION_FILE_NAME = "indexing-exclude.txt";
 const PERSISTED_INDEX_VERSION = 1;
-const SUPPORTED_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".md", ".json"]);
+
+// Binary and non-text formats to exclude from indexing
+const IGNORED_EXTENSIONS = new Set([
+  // Images
+  ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".bmp", ".tiff", ".webp",
+  // Video/Audio
+  ".mp3", ".mp4", ".wav", ".avi", ".mov", ".mkv", ".webm",
+  // Archives
+  ".zip", ".tar", ".gz", ".7z", ".rar", ".jar", ".war", ".ear",
+  // Executables/Binary/Objects
+  ".exe", ".dll", ".so", ".dylib", ".bin", ".o", ".obj", ".pyc", ".class", ".pyo", ".pyd",
+  // Documents/Data
+  ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".psd", ".ai",
+  ".db", ".sqlite", ".sqlite3", ".log", ".lock-package", ".lock", ".ds_store"
+]);
+
 const IGNORED_DIRECTORIES = new Set([
   ".git",
   "node_modules",
@@ -377,8 +392,8 @@ export class CodebaseContextRetriever {
           continue;
         }
 
-        const extension = path.extname(entry.name);
-        if (SUPPORTED_EXTENSIONS.has(extension)) {
+        const extension = path.extname(entry.name).toLowerCase();
+        if (!IGNORED_EXTENSIONS.has(extension)) {
           results.push({
             absolutePath: fullPath,
             relativePath: path.relative(this.rootDir, fullPath)
