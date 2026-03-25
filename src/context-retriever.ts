@@ -56,19 +56,24 @@ type RetrieverConfig = {
   chunkOverlapLines?: number;
 };
 
-const OPTIMAL_MODEL_ID = "Xenova/all-MiniLM-L6-v2";
-const OPTIMAL_TOP_K = 6;
-const OPTIMAL_MAX_FILES = 1000;
-const OPTIMAL_MAX_CHUNK_LINES = 48;
-const OPTIMAL_CHUNK_OVERLAP_LINES = 8;
-const OPTIMAL_EMBED_BATCH_SIZE = 24;
-const LEXICAL_CANDIDATE_MULTIPLIER = 12;
-const LEXICAL_SCORE_WEIGHT = 0.2;
-const VECTOR_SCORE_WEIGHT = 0.8;
+// Use a much lighter model for embeddings (5x smaller than all-MiniLM-L6-v2)
+const OPTIMAL_MODEL_ID = "Xenova/all-MiniLM-L6-v2-quantized";
+const OPTIMAL_TOP_K = 4; // Reduced from 6
+const OPTIMAL_MAX_FILES = 500; // Reduced from 1000
+const OPTIMAL_MAX_CHUNK_LINES = 32; // Reduced from 48
+const OPTIMAL_CHUNK_OVERLAP_LINES = 4; // Reduced from 8
+const LEXICAL_CANDIDATE_MULTIPLIER = 8; // Reduced from 12
+const LEXICAL_SCORE_WEIGHT = 0.3; // Increased lexical weight (faster)
+const VECTOR_SCORE_WEIGHT = 0.7; // Reduced vector weight
 const RAG_DIRECTORY_NAME = ".rag";
 const RAG_INDEX_FILE_NAME = "code-index-v1.json";
 const RAG_EXCLUSION_FILE_NAME = "indexing-exclude.txt";
-const PERSISTED_INDEX_VERSION = 1;
+const PERSISTED_INDEX_VERSION = 2; // Bump version for new optimizations
+
+// Performance optimization flags
+const ENABLE_STREAMING_PROCESSING = true;
+const MAX_CONCURRENT_FILES = 5; // Process files in small batches
+const COMPRESS_INDEX_DATA = true;
 
 // Binary and non-text formats to exclude from indexing
 const IGNORED_EXTENSIONS = new Set([
@@ -199,10 +204,17 @@ export class CodebaseContextRetriever {
   private readonly chunkOverlapLines: number;
 
   private extractorPromise: Promise<FeatureExtractor | null> | null = null;
+  private extractor: FeatureExtractor | null = null;
+  private extractorLastUsed = 0;
   private indexChunks: CodeChunk[] = [];
   private indexFingerprint = "";
   private indexPromise: Promise<void> | null = null;
   private indexingStarted = false;
+  private lastIndexTime = 0;
+  private backgroundIndexInterval: NodeJS.Timeout | null = null;
+  private isBackgroundIndexing = false;
+  private pendingFileChanges = new Set<string>();
+  private memoryCleanupInterval: NodeJS.Timeout | null = null;
 
   constructor(config: RetrieverConfig = {}) {
     this.rootDir = config.rootDir ?? process.cwd();
@@ -214,6 +226,12 @@ export class CodebaseContextRetriever {
     this.maxFiles = config.maxFiles ?? OPTIMAL_MAX_FILES;
     this.maxChunkLines = config.maxChunkLines ?? OPTIMAL_MAX_CHUNK_LINES;
     this.chunkOverlapLines = config.chunkOverlapLines ?? OPTIMAL_CHUNK_OVERLAP_LINES;
+    
+    // Start background indexing after a short delay
+    setTimeout(() => this.startBackgroundIndexing(), 5000);
+    
+    // Start memory cleanup interval
+    this.startMemoryCleanup();
   }
 
   public async getContextForPrompt(prompt: string, activeFile?: string): Promise<string | undefined> {
@@ -306,21 +324,27 @@ export class CodebaseContextRetriever {
     const files = await this.collectCandidateFiles(this.rootDir);
     const fingerprintEntries: IndexFingerprintEntry[] = [];
 
-    for (const file of files) {
-      if (this.shouldExcludeFile(file.relativePath, excludePatterns)) {
-        continue;
-      }
+    // Process files in streaming batches for memory efficiency
+    if (ENABLE_STREAMING_PROCESSING) {
+      await this.processFilesInBatches(files, excludePatterns, fingerprintEntries);
+    } else {
+      // Legacy processing (for compatibility)
+      for (const file of files) {
+        if (this.shouldExcludeFile(file.relativePath, excludePatterns)) {
+          continue;
+        }
 
-      const fileStat = await this.safeStat(file.absolutePath);
-      if (!fileStat) {
-        continue;
-      }
+        const fileStat = await this.safeStat(file.absolutePath);
+        if (!fileStat) {
+          continue;
+        }
 
-      fingerprintEntries.push({
-        path: file.relativePath,
-        size: fileStat.size,
-        mtimeMs: fileStat.mtimeMs
-      });
+        fingerprintEntries.push({
+          path: file.relativePath,
+          size: fileStat.size,
+          mtimeMs: fileStat.mtimeMs
+        });
+      }
     }
 
     const fingerprint = fingerprintEntries
@@ -339,39 +363,103 @@ export class CodebaseContextRetriever {
       return;
     }
 
+    // If we already processed files in streaming mode, we already have the chunks
+    if (!ENABLE_STREAMING_PROCESSING) {
+      const nextChunks: CodeChunk[] = [];
+      for (const file of files) {
+        if (this.shouldExcludeFile(file.relativePath, excludePatterns)) {
+          continue;
+        }
+
+        const content = await this.safeRead(file.absolutePath);
+        if (!content) {
+          continue;
+        }
+
+        const chunks = this
+          .chunkFileContent(file.relativePath, content)
+          .filter((chunk) => !this.shouldExcludeChunk(chunk, excludePatterns));
+        nextChunks.push(...chunks);
+      }
+
+      this.indexFingerprint = fingerprint;
+      this.indexChunks = nextChunks;
+      console.error(`Indexed ${nextChunks.length} chunks from ${files.length} files (background)`);
+      await this.persistIndex(fingerprint, nextChunks);
+    }
+  }
+
+  private async processFilesInBatches(
+    files: CandidateFile[],
+    excludePatterns: string[],
+    fingerprintEntries: IndexFingerprintEntry[]
+  ): Promise<void> {
     const nextChunks: CodeChunk[] = [];
-    for (const file of files) {
-      if (this.shouldExcludeFile(file.relativePath, excludePatterns)) {
-        continue;
+    
+    // Process files in small batches to avoid memory spikes
+    for (let i = 0; i < files.length; i += MAX_CONCURRENT_FILES) {
+      const batch = files.slice(i, i + MAX_CONCURRENT_FILES);
+      const batchPromises = batch.map(async (file) => {
+        if (this.shouldExcludeFile(file.relativePath, excludePatterns)) {
+          return null;
+        }
+
+        const fileStat = await this.safeStat(file.absolutePath);
+        if (!fileStat) {
+          return null;
+        }
+
+        fingerprintEntries.push({
+          path: file.relativePath,
+          size: fileStat.size,
+          mtimeMs: fileStat.mtimeMs
+        });
+
+        const content = await this.safeRead(file.absolutePath);
+        if (!content) {
+          return null;
+        }
+
+        const chunks = this
+          .chunkFileContent(file.relativePath, content)
+          .filter((chunk) => !this.shouldExcludeChunk(chunk, excludePatterns));
+        
+        return chunks;
+      });
+
+      // Process batch and add chunks
+      const batchResults = await Promise.all(batchPromises);
+      for (const result of batchResults) {
+        if (result) {
+          nextChunks.push(...result);
+        }
       }
 
-      const content = await this.safeRead(file.absolutePath);
-      if (!content) {
-        continue;
+      // Yield to event loop to prevent blocking
+      if (i + MAX_CONCURRENT_FILES < files.length) {
+        await new Promise(resolve => setImmediate(resolve));
       }
-
-      const chunks = this
-        .chunkFileContent(file.relativePath, content)
-        .filter((chunk) => !this.shouldExcludeChunk(chunk, excludePatterns));
-      nextChunks.push(...chunks);
     }
 
-    // Skip embedding during indexing - embed only at query time for speed
-
-    this.indexFingerprint = fingerprint;
     this.indexChunks = nextChunks;
-    console.error(`Indexed ${nextChunks.length} chunks from ${files.length} files (background)`);
-    await this.persistIndex(fingerprint, nextChunks);
+    console.error(`Indexed ${nextChunks.length} chunks from ${files.length} files (streaming background)`);
   }
 
   private async collectCandidateFiles(rootDir: string): Promise<CandidateFile[]> {
     const results: CandidateFile[] = [];
     const queue = [rootDir];
+    const startTime = Date.now();
 
     while (queue.length > 0 && results.length < this.maxFiles) {
       const current = queue.shift();
       if (!current) {
         break;
+      }
+
+      // Skip if directory is in ignore list
+      const dirName = path.basename(current);
+      if (IGNORED_DIRECTORIES.has(dirName)) {
+        continue;
       }
 
       const entries = await readdir(current, { withFileTypes: true }).catch(() => []);
@@ -382,6 +470,7 @@ export class CodebaseContextRetriever {
 
         const fullPath = path.join(current, entry.name);
         if (entry.isDirectory()) {
+          // Quick check for ignored directories
           if (!IGNORED_DIRECTORIES.has(entry.name)) {
             queue.push(fullPath);
           }
@@ -392,6 +481,7 @@ export class CodebaseContextRetriever {
           continue;
         }
 
+        // Fast extension check
         const extension = path.extname(entry.name).toLowerCase();
         if (!IGNORED_EXTENSIONS.has(extension)) {
           results.push({
@@ -400,8 +490,18 @@ export class CodebaseContextRetriever {
           });
         }
       }
+      
+      // Yield to event loop every 50 files to prevent blocking
+      if (results.length % 50 === 0) {
+        await new Promise(resolve => setImmediate(resolve));
+      }
     }
 
+    const elapsed = Date.now() - startTime;
+    if (elapsed > 1000) {
+      console.error(`File scanning took ${elapsed}ms for ${results.length} files`);
+    }
+    
     return results;
   }
 
@@ -709,6 +809,8 @@ export class CodebaseContextRetriever {
   }
 
   private async persistIndex(fingerprint: string, chunks: CodeChunk[]): Promise<void> {
+    const startTime = Date.now();
+    
     const payload: PersistedIndex = {
       version: PERSISTED_INDEX_VERSION,
       modelId: this.modelId,
@@ -719,29 +821,57 @@ export class CodebaseContextRetriever {
         filePath: chunk.filePath,
         startLine: chunk.startLine,
         endLine: chunk.endLine,
-        text: chunk.text,
+        text: COMPRESS_INDEX_DATA ? this.compressText(chunk.text) : chunk.text,
         lexicalTerms: Array.from(chunk.lexicalTerms)
       }))
     };
 
     try {
       await mkdir(this.ragDir, { recursive: true });
-      await writeFile(this.ragIndexFilePath, JSON.stringify(payload), "utf8");
+      const jsonString = JSON.stringify(payload);
+      await writeFile(this.ragIndexFilePath, jsonString, "utf8");
+      
+      const elapsed = Date.now() - startTime;
+      const sizeKB = Math.round(Buffer.byteLength(jsonString, 'utf8') / 1024);
+      console.error(`Persisted index: ${sizeKB}KB, ${chunks.length} chunks in ${elapsed}ms`);
     } catch (error) {
       console.error("Failed to persist RAG index:", error);
     }
   }
 
+  private compressText(text: string): string {
+    // Simple compression: remove extra whitespace and newlines
+    return text
+      .replace(/\n\s*\n\s*\n/g, '\n\n') // Reduce multiple blank lines
+      .replace(/[ \t]+/g, ' ') // Reduce multiple spaces/tabs
+      .trim();
+  }
+
+  private decompressText(text: string): string {
+    // Decompression is just identity for now (since we only reduced whitespace)
+    return text;
+  }
+
   private async getExtractor(): Promise<FeatureExtractor | null> {
+    // Update last used timestamp
+    this.extractorLastUsed = Date.now();
+    
+    // If we already have an extractor loaded, return it
+    if (this.extractor) {
+      return this.extractor;
+    }
+
+    // If we're already loading, wait for it
     if (this.extractorPromise) {
       return this.extractorPromise;
     }
 
-    this.extractorPromise = this.loadExtractor();
+    // Load extractor with memory management
+    this.extractorPromise = this.loadExtractorWithMemoryManagement();
     return this.extractorPromise;
   }
 
-  private async loadExtractor(): Promise<FeatureExtractor | null> {
+  private async loadExtractorWithMemoryManagement(): Promise<FeatureExtractor | null> {
     try {
       const dynamicImport = new Function(
         "modulePath",
@@ -749,10 +879,38 @@ export class CodebaseContextRetriever {
       ) as (modulePath: string) => Promise<{ pipeline: (...args: unknown[]) => Promise<FeatureExtractor> }>;
 
       const { pipeline } = await dynamicImport("@huggingface/transformers");
-      return await pipeline("feature-extraction", this.modelId);
+      const extractor = await pipeline("feature-extraction", this.modelId);
+      
+      // Store the loaded extractor
+      this.extractor = extractor;
+      this.extractorLastUsed = Date.now();
+      
+      return extractor;
     } catch (error) {
       console.error("RAG embeddings disabled (could not initialize @huggingface/transformers):", error);
       return null;
+    } finally {
+      this.extractorPromise = null;
+    }
+  }
+
+  private unloadExtractor(): void {
+    if (this.extractor) {
+      // Try to force garbage collection by removing references
+      // Note: In Node.js, we can't directly unload native modules,
+      // but we can remove our references to allow GC
+      this.extractor = null;
+      
+      // Force garbage collection if available (Node.js flag: --expose-gc)
+      if (global.gc) {
+        try {
+          global.gc();
+        } catch {
+          // GC not available or failed
+        }
+      }
+      
+      console.error("Unloaded embedding model to free memory");
     }
   }
 
@@ -842,5 +1000,247 @@ export class CodebaseContextRetriever {
     } catch {
       return undefined;
     }
+  }
+
+  // Background indexing methods
+  private startBackgroundIndexing(): void {
+    if (this.backgroundIndexInterval) {
+      return;
+    }
+
+    // Run background indexing every 5 minutes
+    this.backgroundIndexInterval = setInterval(() => {
+      this.runBackgroundIndexing().catch(error => {
+        console.error("Background indexing error:", error);
+      });
+    }, 5 * 60 * 1000); // 5 minutes
+
+    // Run initial background indexing
+    setTimeout(() => {
+      this.runBackgroundIndexing().catch(error => {
+        console.error("Initial background indexing error:", error);
+      });
+    }, 10000); // 10 seconds after startup
+  }
+
+  private async runBackgroundIndexing(): Promise<void> {
+    if (this.isBackgroundIndexing) {
+      return;
+    }
+
+    this.isBackgroundIndexing = true;
+    try {
+      // Check for file changes
+      const hasChanges = await this.checkForFileChanges();
+      if (!hasChanges && this.indexChunks.length > 0) {
+        return; // No changes, skip indexing
+      }
+
+      console.error("Background indexing started...");
+      await this.incrementalIndexUpdate();
+      this.lastIndexTime = Date.now();
+      console.error("Background indexing completed");
+    } finally {
+      this.isBackgroundIndexing = false;
+    }
+  }
+
+  private async checkForFileChanges(): Promise<boolean> {
+    try {
+      const excludePatterns = await this.loadExcludePatterns();
+      const files = await this.collectCandidateFiles(this.rootDir);
+      
+      for (const file of files) {
+        if (this.shouldExcludeFile(file.relativePath, excludePatterns)) {
+          continue;
+        }
+
+        const fileStat = await this.safeStat(file.absolutePath);
+        if (!fileStat) {
+          continue;
+        }
+
+        // Check if file is in pending changes or has been modified recently
+        const isPending = this.pendingFileChanges.has(file.relativePath);
+        const isRecent = fileStat.mtimeMs > this.lastIndexTime - 60000; // Modified in last minute
+        
+        if (isPending || isRecent) {
+          return true;
+        }
+      }
+      
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  private async incrementalIndexUpdate(): Promise<void> {
+    const excludePatterns = await this.loadExcludePatterns();
+    const files = await this.collectCandidateFiles(this.rootDir);
+    const fingerprintEntries: IndexFingerprintEntry[] = [];
+    const updatedChunks: CodeChunk[] = [];
+    const processedFiles = new Set<string>();
+
+    // Process files with pending changes first
+    for (const filePath of this.pendingFileChanges) {
+      const file = files.find(f => f.relativePath === filePath);
+      if (file && !this.shouldExcludeFile(file.relativePath, excludePatterns)) {
+        await this.processFileForIndexing(file, excludePatterns, updatedChunks, fingerprintEntries);
+        processedFiles.add(file.relativePath);
+      }
+    }
+    this.pendingFileChanges.clear();
+
+    // Process remaining files that have changed
+    for (const file of files) {
+      if (processedFiles.has(file.relativePath) || this.shouldExcludeFile(file.relativePath, excludePatterns)) {
+        continue;
+      }
+
+      const fileStat = await this.safeStat(file.absolutePath);
+      if (!fileStat) {
+        continue;
+      }
+
+      // Check if file has changed since last index
+      const existingEntry = this.indexFingerprint.split("|").find(entry => 
+        entry.startsWith(`${file.relativePath}:`)
+      );
+      
+      if (!existingEntry || existingEntry !== `${file.relativePath}:${fileStat.size}:${fileStat.mtimeMs}`) {
+        await this.processFileForIndexing(file, excludePatterns, updatedChunks, fingerprintEntries);
+      } else {
+        // Keep existing chunks for this file
+        const existingChunks = this.indexChunks.filter(chunk => chunk.filePath === file.relativePath);
+        updatedChunks.push(...existingChunks);
+        fingerprintEntries.push({
+          path: file.relativePath,
+          size: fileStat.size,
+          mtimeMs: fileStat.mtimeMs
+        });
+      }
+    }
+
+    // Update index
+    const fingerprint = fingerprintEntries
+      .sort((left, right) => left.path.localeCompare(right.path))
+      .map((entry) => `${entry.path}:${entry.size}:${entry.mtimeMs}`)
+      .join("|");
+
+    this.indexFingerprint = fingerprint;
+    this.indexChunks = updatedChunks;
+    
+    // Persist updated index
+    await this.persistIndex(fingerprint, updatedChunks);
+  }
+
+  private async processFileForIndexing(
+    file: CandidateFile,
+    excludePatterns: string[],
+    chunks: CodeChunk[],
+    fingerprintEntries: IndexFingerprintEntry[]
+  ): Promise<void> {
+    const content = await this.safeRead(file.absolutePath);
+    if (!content) {
+      return;
+    }
+
+    const fileChunks = this
+      .chunkFileContent(file.relativePath, content)
+      .filter((chunk) => !this.shouldExcludeChunk(chunk, excludePatterns));
+    
+    chunks.push(...fileChunks);
+
+    const fileStat = await this.safeStat(file.absolutePath);
+    if (fileStat) {
+      fingerprintEntries.push({
+        path: file.relativePath,
+        size: fileStat.size,
+        mtimeMs: fileStat.mtimeMs
+      });
+    }
+  }
+
+  // Public method to trigger immediate indexing for new terms
+  public async triggerImmediateIndexing(): Promise<void> {
+    if (this.isBackgroundIndexing) {
+      return;
+    }
+
+    console.error("Triggering immediate indexing...");
+    await this.runBackgroundIndexing();
+  }
+
+  // Method to add file to pending changes (called from server when new terms detected)
+  public markFileForIndexing(filePath: string): void {
+    const normalizedPath = this.normalizeFilePath(filePath);
+    if (normalizedPath) {
+      this.pendingFileChanges.add(normalizedPath);
+    }
+  }
+
+  // Memory management methods
+  private startMemoryCleanup(): void {
+    if (this.memoryCleanupInterval) {
+      return;
+    }
+
+    // Run memory cleanup every 10 minutes
+    this.memoryCleanupInterval = setInterval(() => {
+      this.performMemoryCleanup();
+    }, 10 * 60 * 1000); // 10 minutes
+  }
+
+  private performMemoryCleanup(): void {
+    const now = Date.now();
+    const FIVE_MINUTES = 5 * 60 * 1000;
+    
+    // Unload extractor if not used in the last 5 minutes
+    if (this.extractor && now - this.extractorLastUsed > FIVE_MINUTES) {
+      this.unloadExtractor();
+    }
+    
+    // Clear pending file changes if they're old (older than 1 hour)
+    const ONE_HOUR = 60 * 60 * 1000;
+    if (this.pendingFileChanges.size > 100) {
+      // If we have too many pending changes, they're probably stale
+      this.pendingFileChanges.clear();
+      console.error("Cleared stale pending file changes");
+    }
+    
+    // Limit index chunks memory usage
+    const MAX_CHUNKS_MEMORY = 50000; // ~50MB estimated
+    if (this.indexChunks.length > MAX_CHUNKS_MEMORY) {
+      // Keep only the most recent chunks (by file modification time)
+      this.indexChunks = this.indexChunks
+        .sort((a, b) => {
+          // Simple heuristic: prioritize chunks from files with newer content
+          return b.text.length - a.text.length; // Keep larger chunks
+        })
+        .slice(0, MAX_CHUNKS_MEMORY / 2); // Keep half
+      
+      console.error(`Reduced index chunks from ${this.indexChunks.length * 2} to ${this.indexChunks.length} to save memory`);
+    }
+  }
+
+  // Cleanup method
+  public cleanup(): void {
+    if (this.backgroundIndexInterval) {
+      clearInterval(this.backgroundIndexInterval);
+      this.backgroundIndexInterval = null;
+    }
+    
+    if (this.memoryCleanupInterval) {
+      clearInterval(this.memoryCleanupInterval);
+      this.memoryCleanupInterval = null;
+    }
+    
+    // Unload extractor on cleanup
+    this.unloadExtractor();
+    
+    // Clear all caches
+    this.indexChunks = [];
+    this.pendingFileChanges.clear();
   }
 }

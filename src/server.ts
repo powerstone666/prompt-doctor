@@ -22,6 +22,11 @@ const SECRET_BLOCK_MESSAGE =
 const SECRET_SCAN_UNAVAILABLE_MESSAGE =
   "Secret scanning failed. Request was not forwarded to the LLM. Please retry later.";
 
+// Track new terms to trigger background indexing
+const newTermsCache = new Map<string, Set<string>>();
+const NEW_TERMS_THRESHOLD = 10; // Number of new terms before triggering indexing
+const NEW_TERMS_TIMEOUT = 30000; // 30 seconds timeout for collecting new terms
+
 mcp.registerTool(
   "enhance_prompt",
   {
@@ -81,6 +86,11 @@ mcp.registerTool(
       await gitleaksGuard.assertNoSecrets("user prompt", prompt);
       repoContext = (await contextRetriever.getContextForPrompt(prompt, activeFile)) ?? "";
       await gitleaksGuard.assertNoSecrets("retrieved repo context", repoContext);
+      
+      // Check for new terms in the prompt that might need indexing
+      if (activeFile && repoContext) {
+        checkForNewTerms(targetDir, prompt, activeFile, contextRetriever);
+      }
     } catch (error) {
       if (error instanceof SecretLeakageDetectedError) {
         return {
@@ -112,6 +122,96 @@ mcp.registerTool(
     }
   }
 );
+
+// Helper function to extract terms from text
+function extractTerms(text: string): Set<string> {
+  const normalized = text.toLowerCase();
+  const tokens = normalized.match(/[a-z0-9_]{3,}/g) ?? [];
+  return new Set(tokens);
+}
+
+// Check for new terms and trigger background indexing if needed
+function checkForNewTerms(
+  targetDir: string,
+  prompt: string,
+  activeFile: string,
+  contextRetriever: CodebaseContextRetriever
+): void {
+  try {
+    // Extract terms from the prompt
+    const promptTerms = extractTerms(prompt);
+    
+    // Get or create new terms cache for this directory
+    let newTerms = newTermsCache.get(targetDir);
+    if (!newTerms) {
+      newTerms = new Set<string>();
+      newTermsCache.set(targetDir, newTerms);
+      
+      // Set timeout to clear new terms cache
+      setTimeout(() => {
+        newTermsCache.delete(targetDir);
+      }, NEW_TERMS_TIMEOUT);
+    }
+    
+    // Add new terms from prompt
+    for (const term of promptTerms) {
+      newTerms.add(term);
+    }
+    
+    // Check if we have enough new terms to trigger indexing
+    if (newTerms.size >= NEW_TERMS_THRESHOLD) {
+      console.error(`Detected ${newTerms.size} new terms, triggering background indexing for ${targetDir}`);
+      
+      // Mark the active file for indexing
+      contextRetriever.markFileForIndexing(activeFile);
+      
+      // Trigger immediate indexing in background
+      contextRetriever.triggerImmediateIndexing().catch(error => {
+        console.error("Failed to trigger immediate indexing:", error);
+      });
+      
+      // Clear the cache after triggering
+      newTermsCache.delete(targetDir);
+    }
+  } catch (error) {
+    console.error("Error checking for new terms:", error);
+  }
+}
+
+// Cleanup function to be called on server shutdown
+function cleanupServer(): void {
+  console.error("Cleaning up server resources...");
+  
+  // Cleanup all context retrievers
+  for (const [dir, retriever] of contextRetrieverCache) {
+    try {
+      retriever.cleanup();
+    } catch (error) {
+      console.error(`Error cleaning up retriever for ${dir}:`, error);
+    }
+  }
+  
+  // Clear caches
+  contextRetrieverCache.clear();
+  newTermsCache.clear();
+  
+  console.error("Server cleanup completed");
+}
+
+// Handle process termination
+process.on('SIGINT', () => {
+  cleanupServer();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  cleanupServer();
+  process.exit(0);
+});
+
+process.on('exit', () => {
+  cleanupServer();
+});
 
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
