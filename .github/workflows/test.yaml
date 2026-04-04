@@ -15,7 +15,8 @@ jobs:
            with:
               node-version: 25
          - name: build and run
-           run: npm run build
+           run: npm ci
+         - run: npm run build
          - run: npm run test --if-present
          - run: echo "build and test succesful"
          - run: npm run dev
