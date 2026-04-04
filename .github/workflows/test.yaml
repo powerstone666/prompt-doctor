@@ -1,0 +1,13 @@
+name: test-yaml-playground
+on:
+  pull_request:
+     branches: ["actions-test"]
+  workflow_dispatch: {}
+
+jobs:
+   test1:
+      runs-on: ubuntu-latest
+      steps:
+          - run: echo "testing"
+
+      
