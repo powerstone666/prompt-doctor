@@ -1,13 +1,23 @@
 name: test-yaml-playground
 on:
-  pull_request:
-     branches: ["actions-test"]
+  push:
+     branches: ["main"]
   workflow_dispatch: {}
 
 jobs:
    test1:
       runs-on: ubuntu-latest
       steps:
-          - run: echo "testing"
+         - name: checkout branch
+           uses: actions/checkout@v4
+         - name: use nodejs
+           uses: actions/setup-node@v4
+           with: node-version:25
+         - name: build and run: 
+         - run: npm run build
+         - run: npm run test -if-present
+         - run: echo "build and test succesful"
+         - run: npm run dev
+         - run: echo "everything done"
 
       
