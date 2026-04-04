@@ -19,7 +19,6 @@ jobs:
          - run: npm run build
          - run: npm run test --if-present
          - run: echo "build and test succesful"
-         - run: npm run dev
          - run: echo "everything done"
 
       
